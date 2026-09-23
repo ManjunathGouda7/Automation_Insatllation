@@ -74,11 +74,13 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Download only, do not run installer")
     parser.add_argument("--silent", action="store_true", help="Perform silent unattended installation")
     parser.add_argument("--test-url", help="Direct test URL to download and install (skips email check)")
+    parser.add_argument("--url", dest="test_url", help="Direct download URL (alias for --test-url)")
 
     args = parser.parse_args()
+    cleaned_url = args.test_url.strip("\"' ") if args.test_url else None
     run(
         config_path=args.config,
         dry_run=args.dry_run,
         force_silent=True if args.silent else None,
-        test_url=args.test_url,
+        test_url=cleaned_url,
     )

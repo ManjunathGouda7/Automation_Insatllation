@@ -21,6 +21,8 @@ ENV/
 
 # Downloaded files and extractions
 downloads/
+inbox/*
+!inbox/.gitkeep
 
 # IDE & OS files
 .vscode/

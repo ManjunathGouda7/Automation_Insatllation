@@ -170,6 +170,10 @@ def automate_nsis_wizard(file_path, timeout=300):
         # Step 3: Handle Driver Installation Script Console Window
         for c_hwnd, c_title in console_hwnds:
             print(f"[install.py] Detected Driver Console ('{c_title}'). Sending Enter key to continue...")
+            try:
+                win32gui.SetForegroundWindow(c_hwnd)
+            except Exception:
+                pass
             win32gui.PostMessage(c_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             win32gui.PostMessage(c_hwnd, win32con.WM_CHAR, 13, 0)
             win32gui.PostMessage(c_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
@@ -252,10 +256,43 @@ def install_file(file_path, silent=False):
         return False
 
 
+def find_latest_installer(download_dir="downloads"):
+    """Finds the most recent installer or zip archive in the download directory."""
+    if not os.path.exists(download_dir):
+        return None
+
+    candidates = []
+    for root, _, files in os.walk(download_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in (".exe", ".msi", ".zip"):
+                candidates.append(os.path.join(root, f))
+
+    if not candidates:
+        return None
+
+    # Newest file first
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        silent_mode = "--silent" in sys.argv
-        target = [arg for arg in sys.argv[1:] if not arg.startswith("--")][0]
-        install_file(target, silent=silent_mode)
+    silent_mode = "--silent" in sys.argv
+    file_args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+
+    target_installer = None
+    if file_args:
+        target_installer = file_args[0].strip("\"' ")
     else:
-        print("Usage: python install.py <path_to_installer_or_zip> [--silent]")
+        # Auto-detect latest installer in downloads/ folder
+        target_installer = find_latest_installer("downloads")
+        if target_installer:
+            print(f"[install.py] Auto-detected downloaded installer: {target_installer}")
+        else:
+            print("Usage: python install.py [path_to_installer_or_zip] [--silent]")
+            print("No installer found in 'downloads/' directory.")
+            sys.exit(1)
+
+    if target_installer:
+        success = install_file(target_installer, silent=silent_mode)
+        sys.exit(0 if success else 1)
