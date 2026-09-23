@@ -5,6 +5,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+import requests
 
 try:
     from bs4 import BeautifulSoup
@@ -236,14 +237,155 @@ def get_imap_since_date(days_back=2):
     return dt.strftime("%d-%b-%Y")
 
 
-def get_latest_download_link(config_path="config.json"):
-    """Fetches the latest email matching the software criteria and returns the download URL."""
+def _get_msgraph_token(cfg):
+    """Retrieves an access token for Microsoft Graph via cached refresh token or interactive Device Code login."""
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ms_token_cache.json")
+    client_id = cfg.get("azure_client_id", "d3590ed6-52b3-4102-aeff-aad2292ab01c")
+
+    # 1. Try loading cached token and refresh it
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+            refresh_token = token_data.get("refresh_token")
+            if refresh_token:
+                token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+                data = {
+                    "client_id": client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "scope": "offline_access https://graph.microsoft.com/Mail.Read",
+                }
+                r = requests.post(token_url, data=data, timeout=30)
+                if r.status_code == 200:
+                    new_token = r.json()
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(new_token, f)
+                    return new_token.get("access_token")
+        except Exception:
+            pass
+
+    # 2. Start Device Code Flow
+    dc_url = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+    data = {
+        "client_id": client_id,
+        "scope": "offline_access https://graph.microsoft.com/Mail.Read",
+    }
+    try:
+        r = requests.post(dc_url, data=data, timeout=30)
+    except Exception as e:
+        print(f"[mail.py] Could not reach Microsoft OAuth2 endpoint: {e}")
+        return None
+
+    if r.status_code != 200:
+        print(f"[mail.py] Could not initiate Microsoft Device Code: {r.text}")
+        return None
+
+    dc_info = r.json()
+    user_code = dc_info.get("user_code")
+    verification_uri = dc_info.get("verification_uri", "https://login.microsoft.com/device")
+    device_code = dc_info.get("device_code")
+    interval = int(dc_info.get("interval", 5))
+
+    print("\n" + "=" * 65)
+    print("       MICROSOFT 365 MODERN AUTHENTICATION (NO PASSWORDS NEEDED)")
+    print("=" * 65)
+    print(f"1. Open in your browser:  {verification_uri}")
+    print(f"2. Enter the code:        {user_code}")
+    print(f"3. Sign in with:          {cfg.get('email_user', 'your work account')}")
+    print("=" * 65 + "\n")
+    print("[mail.py] Waiting for browser sign-in approval...")
+
+    token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    start_poll = time.time()
+    while time.time() - start_poll < 300:
+        time.sleep(interval)
+        poll_data = {
+            "client_id": client_id,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+        }
+        res = requests.post(token_url, data=poll_data, timeout=30)
+        res_data = res.json()
+        if res.status_code == 200 and "access_token" in res_data:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(res_data, f)
+            print("[mail.py] Authentication approved! Token saved to cache.")
+            return res_data["access_token"]
+        elif res_data.get("error") == "authorization_pending":
+            continue
+        elif res_data.get("error") == "slow_down":
+            time.sleep(5)
+        else:
+            print(f"[mail.py] Sign-in failed or expired: {res_data}")
+            return None
+
+    print("[mail.py] Authentication timed out.")
+    return None
+
+
+def fetch_update_via_msgraph(cfg):
+    """Fetches update info via Microsoft Graph API."""
+    token = _get_msgraph_token(cfg)
+    if not token:
+        return None
+
+    target_software = cfg.get("target_software", "V-DPWR-EPR")
+    subject_keyword = cfg.get("subject_keyword", target_software)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    graph_url = f'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=15&$search="{subject_keyword}"'
+    print(f"[mail.py] Querying Microsoft Graph for messages matching '{subject_keyword}'...")
+    try:
+        r = requests.get(graph_url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            graph_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=15&$orderby=receivedDateTime desc"
+            r = requests.get(graph_url, headers=headers, timeout=30)
+            if r.status_code != 200:
+                print(f"[mail.py] Graph API query failed: {r.status_code} {r.text}")
+                return None
+
+        messages = r.json().get("value", [])
+        print(f"[mail.py] Retrieved {len(messages)} candidate emails from Microsoft Graph.")
+
+        for m in messages:
+            subject = m.get("subject", "")
+            body_content = m.get("body", {}).get("content", "")
+            body_type = m.get("body", {}).get("contentType", "html")
+
+            plain_text = body_content if body_type == "text" else ""
+            html_text = body_content if body_type == "html" else ""
+
+            url, version = extract_version_and_download_link(plain_text, html_text, target_software)
+            if url:
+                print(f"[mail.py] Found matching email via Graph API: '{subject}'")
+                print(f"[mail.py] Extracted URL: {url} (Version: {version})")
+                return {"url": url, "version": version, "subject": subject}
+
+    except Exception as e:
+        print(f"[mail.py] Error fetching from Graph API: {e}")
+
+    return None
+
+
+def get_latest_update_info(config_path="config.json"):
+    """Fetches the latest email matching the software criteria and returns update info dictionary."""
     cfg = load_config(config_path)
 
     target_software = cfg.get("target_software", "V-DPWR-EPR")
     subject_keyword = cfg.get("subject_keyword", target_software)
     days_back = int(cfg.get("days_back", 2))
     test_download_url = cfg.get("test_download_url", "").strip()
+
+    # If Graph API is explicitly chosen or forced
+    if cfg.get("use_graph") or cfg.get("auth_method") == "graph":
+        print("[mail.py] Using Microsoft Graph API authentication...")
+        res = fetch_update_via_msgraph(cfg)
+        if res:
+            return res
+        if test_download_url:
+            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
+        return None
 
     print(f"[mail.py] Target Software: {target_software}")
     print(f"[mail.py] Date filter: past {days_back} day(s)")
@@ -254,24 +396,24 @@ def get_latest_download_link(config_path="config.json"):
         mail.login(cfg["email_user"], cfg["email_pass"])
     except imaplib.IMAP4.error as e:
         err_msg = str(e)
-        print(f"\n[mail.py] [ERROR] IMAP Authentication Failed: {err_msg}")
+        print(f"\n[mail.py] [NOTICE] IMAP Authentication Rejected: {err_msg}")
         if "AUTHENTICATE failed" in err_msg or "not supported" in err_msg:
             print("[mail.py] ------------------------------------------------------------------")
-            print("[mail.py] Office 365 / Outlook Notice:")
-            print("[mail.py] Microsoft disables standard password login for IMAP by default.")
-            print("[mail.py] To use Office 365 IMAP, you must create an App Password under:")
-            print("[mail.py] https://mysignins.microsoft.com/security-info -> Add sign-in method -> App Password")
-            print("[mail.py] and paste that password into 'email_pass' in config.json.")
+            print("[mail.py] Microsoft Office 365 IMAP password authentication is retired.")
+            print("[mail.py] Switching automatically to Microsoft 365 Modern Authentication (OAuth2)...")
             print("[mail.py] ------------------------------------------------------------------")
+            graph_res = fetch_update_via_msgraph(cfg)
+            if graph_res:
+                return graph_res
         if test_download_url:
             print(f"[mail.py] Using fallback test_download_url from config: {test_download_url}")
-            return test_download_url
+            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
         return None
     except Exception as e:
         print(f"[mail.py] [ERROR] Connection error: {e}")
         if test_download_url:
             print(f"[mail.py] Using fallback test_download_url from config: {test_download_url}")
-            return test_download_url
+            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
         return None
 
     try:
@@ -336,6 +478,12 @@ def get_latest_download_link(config_path="config.json"):
             mail.logout()
         except Exception:
             pass
+
+
+def get_latest_download_link(config_path="config.json"):
+    """Fetches the latest email and returns the download URL string."""
+    info = get_latest_update_info(config_path)
+    return info["url"] if info else None
 
 
 if __name__ == "__main__":

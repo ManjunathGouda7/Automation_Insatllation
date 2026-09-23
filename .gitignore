@@ -1,9 +1,12 @@
 # Credentials & local config (NEVER commit passwords!)
 config.json
+.ms_token_cache.json
+*.cache
 *.jsonc
 *.exe
 *.zip
 *.log
+update_history.json
 
 # Python bytecode & cache
 __pycache__/
