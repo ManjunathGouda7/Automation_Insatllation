@@ -10,9 +10,13 @@ import zipfile
 try:
     import win32gui
     import win32con
+    import win32process
     HAVE_WIN32 = True
 except ImportError:
     HAVE_WIN32 = False
+
+# Ensure driver script does not pause
+os.environ["DRIVERS_BAT_NO_PAUSE"] = "1"
 
 
 def is_admin():
@@ -197,13 +201,28 @@ def automate_nsis_wizard(file_path, timeout=300):
         setup_hwnds = []
         console_hwnds = []
 
+        my_console = None
+        try:
+            my_console = ctypes.windll.kernel32.GetConsoleWindow()
+        except Exception:
+            pass
+
         def enum_windows(hwnd, _):
             if win32gui.IsWindowVisible(hwnd):
+                if my_console and hwnd == my_console:
+                    return
+                try:
+                    _, win_pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if win_pid == os.getpid():
+                        return
+                except Exception:
+                    pass
+
                 title = win32gui.GetWindowText(hwnd).strip()
                 cls = win32gui.GetClassName(hwnd)
                 if "v-dpwr" in title.lower() or ("setup" in title.lower() and "1.1." in title.lower()):
                     setup_hwnds.append((hwnd, title))
-                elif cls == "ConsoleWindowClass" or "cmd.exe" in title.lower() or "driver" in title.lower() or "administrator" in title.lower():
+                elif cls == "ConsoleWindowClass" or "cmd.exe" in title.lower() or "driver" in title.lower():
                     console_hwnds.append((hwnd, title))
 
         try:
@@ -270,7 +289,7 @@ def automate_nsis_wizard(file_path, timeout=300):
 
         # Step 3: Handle Driver Installation Script Console Window
         for c_hwnd, c_title in console_hwnds:
-            print(f"[install.py] Detected Driver Console ('{c_title}'). Sending Enter key to continue...")
+            print(f"[install.py] Detected Driver Console ('{c_title}'). Dismissing to unblock setup...")
             try:
                 win32gui.SetForegroundWindow(c_hwnd)
             except Exception:
@@ -283,6 +302,17 @@ def automate_nsis_wizard(file_path, timeout=300):
                 ctypes.windll.user32.keybd_event(0x0D, 0, 2, 0)
                 ctypes.windll.user32.keybd_event(0x20, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0x20, 0, 2, 0)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            try:
+                win32gui.PostMessage(c_hwnd, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+            try:
+                _, cmd_pid = win32process.GetWindowThreadProcessId(c_hwnd)
+                if cmd_pid and cmd_pid != os.getpid():
+                    subprocess.run(["taskkill", "/PID", str(cmd_pid), "/F", "/T"], capture_output=True)
             except Exception:
                 pass
             driver_cleared = True
