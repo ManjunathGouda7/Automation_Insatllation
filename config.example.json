@@ -1,0 +1,11 @@
+{
+  "imap_server": "outlook.office365.com",
+  "email_user": "your_email@domain.com",
+  "email_pass": "your_app_password_here",
+  "target_software": "V-DPWR-EPR",
+  "subject_keyword": "V-DPWR-EPR",
+  "days_back": 2,
+  "download_dir": "downloads",
+  "silent_install": false,
+  "test_download_url": ""
+}

@@ -1,0 +1,22 @@
+# Credentials & local config (NEVER commit passwords!)
+config.json
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# Downloaded files and extractions
+downloads/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
