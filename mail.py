@@ -71,23 +71,27 @@ def _extract_email_contents(msg):
 def extract_version(text):
     """Extracts variable version numbers from text like:
 
+    - 'Please find the download link for V-DPWR-EPR software (version v1.1.1.3).'
     - 'Please find the download link for V-DPWR-EPR software (version [v1.1.1.X])'
     - 'version [v1.1.1.25]'
     - 'version [1.1.1.3]'
     - 'v1.1.1.5'
+    - 'v1.1.x.x'
     """
     if not text:
         return None
 
     patterns = [
+        # Matches: (version v1.1.1.3), (version [v1.1.1.X]), (version 1.1.x.x)
+        r"\(version\s*\[?\s*v?([0-9a-zA-Z._-]+)\]?\)",
         # Matches: version [v1.1.1.1], version [1.1.1.25], version (v1.1.1.X), version [v1.1.1.X]
         r"version\s*[\(\[]\s*v?([0-9a-zA-Z._-]+)[\)\]]",
         # Matches: version: v1.1.1.1 or version v1.1.1.1
-        r"version\s*[:\s]\s*v?([0-9]+(?:\.[0-9a-zA-Z_-]+)+)",
+        r"version\s*[:\s]\s*v?([0-9a-zA-Z]+(?:\.[0-9a-zA-Z_-]+)+)",
         # Matches standalone: [v1.1.1.2] or [1.1.1.2]
-        r"\[v?([0-9]+(?:\.[0-9a-zA-Z_-]+)+)\]",
-        # Generic: v1.1.1.2
-        r"\bv([0-9]+(?:\.[0-9a-zA-Z_-]+)+)\b",
+        r"\[v?([0-9a-zA-Z]+(?:\.[0-9a-zA-Z_-]+)+)\]",
+        # Generic: v1.1.1.2 or v1.1.x.x
+        r"\bv([0-9a-zA-Z]+(?:\.[0-9a-zA-Z_-]+)+)\b",
     ]
 
     for pat in patterns:
@@ -107,8 +111,9 @@ def extract_links_from_content(plain_text, html_text, target_software="V-DPWR-EP
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
             anchor_text = a_tag.get_text().strip()
+            parent_text = a_tag.find_parent().get_text() if a_tag.find_parent() else ""
             if href.startswith(("http://", "https://")):
-                collected_urls.append((href, anchor_text))
+                collected_urls.append((href, anchor_text, parent_text))
 
     # 2. Extract plain text URLs using regex
     combined_text = f"{plain_text}\n{html_text}"
@@ -116,21 +121,30 @@ def extract_links_from_content(plain_text, html_text, target_software="V-DPWR-EP
     for u in plain_urls:
         u_clean = u.rstrip(".,;)>]")
         if not any(u_clean == existing[0] for existing in collected_urls):
-            collected_urls.append((u_clean, ""))
+            collected_urls.append((u_clean, "", ""))
 
     if not collected_urls:
         return []
 
     # Prioritization scoring:
-    # High score for direct installer extensions (.exe, .msi, .zip)
-    # Higher score if URL or anchor text mentions target software or "download"
     installer_exts = (".exe", ".msi", ".zip", ".pkg", ".dmg", ".deb")
 
     def score_url(item):
-        url, anchor = item
+        url, anchor, parent = item
         score = 0
         url_lower = url.lower()
         anchor_lower = anchor.lower()
+        parent_lower = parent.lower()
+
+        # If anchor itself is a version string (e.g. <a href="...">v1.1.1.3</a>)
+        if re.match(r"^v?[0-9a-zA-Z]+(?:\.[0-9a-zA-Z_-]+)+$", anchor, re.IGNORECASE):
+            score += 200
+
+        # If parent paragraph mentions download link or target software
+        if target_software.lower() in parent_lower:
+            score += 100
+        if "download link" in parent_lower:
+            score += 80
 
         for ext in installer_exts:
             if url_lower.split("?")[0].endswith(ext):
@@ -150,7 +164,70 @@ def extract_links_from_content(plain_text, html_text, target_software="V-DPWR-EP
         return score
 
     sorted_urls = sorted(collected_urls, key=score_url, reverse=True)
-    return [url for url, _ in sorted_urls if score_url((url, _)) > -50]
+    return [url for url, _, _ in sorted_urls if score_url((url, _, _)) > -50]
+
+
+def extract_version_and_download_link(plain_text, html_text, target_software="V-DPWR-EPR"):
+    """Specifically targets:
+
+    'Please find the download link for V-DPWR-EPR software (version v1.1.1.3).'
+    where the link is either the hyperlink on 'v1.1.1.3' itself:
+        (version <a href="...">v1.1.1.3</a>)
+    or immediately following the version:
+        (version v1.1.1.3). https://...
+        (version v1.1.1.3) <a href="...">Download</a>
+
+    Returns:
+        tuple: (download_url, version_string) or (None, None)
+    """
+    # 1. Check HTML anchors (like <a href="...">v1.1.1.3</a>)
+    if html_text and BeautifulSoup:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"].strip()
+            anchor_text = a_tag.get_text().strip()
+            if not href.startswith(("http://", "https://")):
+                continue
+
+            parent_text = a_tag.find_parent().get_text() if a_tag.find_parent() else ""
+            combined_context = f"{anchor_text} {parent_text}"
+
+            # Case A: The anchor text IS the version itself (e.g. <a href="...">v1.1.1.3</a>)
+            if re.match(r"^v?[0-9a-zA-Z]+(?:\.[0-9a-zA-Z_-]+)+$", anchor_text, re.IGNORECASE):
+                if (
+                    target_software.lower() in combined_context.lower()
+                    or "download link" in combined_context.lower()
+                    or "version" in combined_context.lower()
+                ):
+                    v = extract_version(anchor_text) or anchor_text.lstrip("vV")
+                    return href, v
+
+            # Case B: The anchor is inside a block mentioning target software and version
+            if target_software.lower() in combined_context.lower() and "version" in combined_context.lower():
+                v = extract_version(combined_context)
+                if v:
+                    return href, v
+
+    # 2. Check Plain Text: URL directly follows the version pattern
+    # e.g.: (version v1.1.1.3). https://... or (version [v1.1.1.X]): https://...
+    combined_plain = f"{plain_text}\n{html_text}"
+    pt_match = re.search(
+        r"\(version\s*\[?v?([0-9a-zA-Z._-]+)\]?\)[^a-zA-Z0-9\r\n]*(https?://[^\s<>\"']+)",
+        combined_plain,
+        re.IGNORECASE,
+    )
+    if pt_match:
+        ver = pt_match.group(1).strip()
+        url = pt_match.group(2).rstrip(".,;)>]").strip()
+        return url, ver
+
+    # 3. Fallback: General extraction
+    ver = extract_version(combined_plain)
+    links = extract_links_from_content(plain_text, html_text, target_software)
+    if links:
+        return links[0], ver
+
+    return None, ver
 
 
 def get_imap_since_date(days_back=2):
@@ -238,16 +315,18 @@ def get_latest_download_link(config_path="config.json"):
             if not matches_keyword:
                 continue
 
-            detected_version = extract_version(f"{subject}\n{combined_body}")
             print(f"[mail.py] Matched email: '{subject}'")
+            url, detected_version = extract_version_and_download_link(plain_text, html_text, target_software)
             if detected_version:
                 print(f"[mail.py] Detected software version: {detected_version}")
 
-            links = extract_links_from_content(plain_text, html_text, target_software)
-            if links:
-                chosen_link = links[0]
-                print(f"[mail.py] Extracted download URL: {chosen_link}")
-                return chosen_link
+            if url:
+                print(f"[mail.py] Extracted download URL: {url}")
+                return {
+                    "url": url,
+                    "version": detected_version,
+                    "subject": subject,
+                }
 
         print(f"[mail.py] No matching emails with download links found for {target_software}.")
         return None
