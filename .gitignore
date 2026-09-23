@@ -1,5 +1,9 @@
 # Credentials & local config (NEVER commit passwords!)
 config.json
+*.jsonc
+*.exe
+*.zip
+*.log
 
 # Python bytecode & cache
 __pycache__/
