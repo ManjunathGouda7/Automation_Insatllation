@@ -1,4 +1,6 @@
+import ctypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +13,46 @@ try:
     HAVE_WIN32 = True
 except ImportError:
     HAVE_WIN32 = False
+
+
+def is_admin():
+    """Checks whether the current process has administrative privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def ensure_admin():
+    """Ensures the script is running with administrative privileges.
+    If not, relaunches itself via ShellExecute 'runas'.
+    """
+    if not sys.platform.startswith("win32"):
+        return True
+
+    if is_admin():
+        return True
+
+    print("\n" + "=" * 65)
+    print("      ADMINISTRATOR PRIVILEGES REQUIRED FOR SETUP AUTOMATION")
+    print("=" * 65)
+    print("Windows requires Administrator privileges so this script can interact")
+    print("with the elevated setup wizard (clicking Next, Agree, Finish).")
+    print("Requesting Administrator elevation (UAC prompt)...")
+    print("=" * 65 + "\n")
+
+    script = os.path.abspath(sys.argv[0])
+    args = " ".join([f'"{a}"' for a in sys.argv[1:]])
+    cmd = f'"{script}" {args}'.strip()
+    ret = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, cmd, os.path.abspath("."), 1
+    )
+    if ret > 32:
+        print("[install.py] Elevated process started. Exiting non-elevated process.")
+        sys.exit(0)
+    else:
+        print(f"[install.py] [WARNING] Elevation was not granted (error code {ret}).")
+        return False
 
 
 def extract_zip(archive_path, extract_dir=None):
@@ -64,22 +106,58 @@ def extract_zip(archive_path, extract_dir=None):
 
 
 def _find_window_buttons(parent_hwnd):
-    """Finds all child buttons inside a window and maps their text to hwnd."""
+    """Finds all child buttons inside a window.
+    Maps normalized lowercase text and control IDs to (hwnd, text, ctrl_id).
+    """
     buttons = {}
     if not HAVE_WIN32:
         return buttons
 
     def enum_children(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
+        if win32gui.IsWindowVisible(hwnd):
             cls = win32gui.GetClassName(hwnd).lower()
             text = win32gui.GetWindowText(hwnd).strip()
-            if "button" in cls or cls == "#32770":
-                buttons[text] = hwnd
+            ctrl_id = win32gui.GetWindowLong(hwnd, win32con.GWL_ID)
+
+            if "button" in cls:
+                clean = text.replace("&", "").strip().lower()
+                if clean:
+                    buttons[clean] = (hwnd, text, ctrl_id)
+                buttons[ctrl_id] = (hwnd, text, ctrl_id)
+
     try:
         win32gui.EnumChildWindows(parent_hwnd, enum_children, None)
     except Exception:
         pass
     return buttons
+
+
+def _click_button(parent_hwnd, button_info):
+    """Clicks a button using BM_CLICK, WM_COMMAND, and SetForegroundWindow."""
+    hwnd, text, ctrl_id = button_info
+    try:
+        win32gui.SetForegroundWindow(parent_hwnd)
+    except Exception:
+        pass
+
+    try:
+        win32gui.SendMessage(hwnd, win32con.BM_CLICK, 0, 0)
+        win32gui.PostMessage(hwnd, win32con.BM_CLICK, 0, 0)
+    except Exception:
+        pass
+
+    if ctrl_id:
+        try:
+            win32gui.SendMessage(parent_hwnd, win32con.WM_COMMAND, ctrl_id, hwnd)
+        except Exception:
+            pass
+
+    # Default button trigger via Enter key
+    try:
+        win32gui.PostMessage(parent_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+        win32gui.PostMessage(parent_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+    except Exception:
+        pass
 
 
 def automate_nsis_wizard(file_path, timeout=300):
@@ -123,7 +201,7 @@ def automate_nsis_wizard(file_path, timeout=300):
             if win32gui.IsWindowVisible(hwnd):
                 title = win32gui.GetWindowText(hwnd).strip()
                 cls = win32gui.GetClassName(hwnd)
-                if ("v-dpwr" in title.lower() and "setup" in title.lower()) or "v-dpwr" in title.lower():
+                if "v-dpwr" in title.lower() or ("setup" in title.lower() and "1.1." in title.lower()):
                     setup_hwnds.append((hwnd, title))
                 elif cls == "ConsoleWindowClass" or "cmd.exe" in title.lower() or "driver" in title.lower() or "administrator" in title.lower():
                     console_hwnds.append((hwnd, title))
@@ -137,33 +215,56 @@ def automate_nsis_wizard(file_path, timeout=300):
         for s_hwnd, title in setup_hwnds:
             buttons = _find_window_buttons(s_hwnd)
 
+            btn_next = None
+            btn_agree = None
+            btn_finish = None
+            btn_readme = None
+
+            for key, val in buttons.items():
+                if isinstance(key, str):
+                    if "next" in key:
+                        btn_next = val
+                    elif "agree" in key:
+                        btn_agree = val
+                    elif "finish" in key:
+                        btn_finish = val
+                    elif "readme" in key:
+                        btn_readme = val
+
+            # Control ID 1 is standard NSIS IDOK (Next / Agree / Finish)
+            btn_idok = buttons.get(1)
+
             # Step 1: Welcome Screen -> Click 'Next >'
-            if not next_clicked and "Next >" in buttons:
+            if not next_clicked and (btn_next or ("welcome" in title.lower() and btn_idok)):
+                target_btn = btn_next or btn_idok
                 print(f"[install.py] Found Welcome Screen ('{title}'). Clicking 'Next >'...")
-                win32gui.PostMessage(buttons["Next >"], win32con.BM_CLICK, 0, 0)
+                _click_button(s_hwnd, target_btn)
                 next_clicked = True
-                time.sleep(1.2)
+                time.sleep(1.5)
                 continue
 
             # Step 2: License Agreement -> Click 'I Agree'
-            if not agree_clicked and "I Agree" in buttons:
+            if next_clicked and not agree_clicked and (btn_agree or ("license" in title.lower() and btn_idok)):
+                target_btn = btn_agree or btn_idok
                 print(f"[install.py] Found License Agreement ('{title}'). Clicking 'I Agree'...")
-                win32gui.PostMessage(buttons["I Agree"], win32con.BM_CLICK, 0, 0)
+                _click_button(s_hwnd, target_btn)
                 agree_clicked = True
-                time.sleep(1.2)
+                time.sleep(1.5)
                 continue
 
             # Step 4: Completion Screen -> Click 'Finish'
-            if "Finish" in buttons:
-                # Optionally uncheck Show Readme if present
-                for b_text, b_hwnd in buttons.items():
-                    if "readme" in b_text.lower():
-                        win32gui.SendMessage(b_hwnd, win32con.BM_SETCHECK, win32con.BST_UNCHECKED, 0)
+            if btn_finish or (agree_clicked and "completing" in title.lower() and btn_idok):
+                target_btn = btn_finish or btn_idok
+                if btn_readme:
+                    try:
+                        win32gui.SendMessage(btn_readme[0], win32con.BM_SETCHECK, win32con.BST_UNCHECKED, 0)
+                    except Exception:
+                        pass
 
                 print(f"[install.py] Found Completion Screen ('{title}'). Clicking 'Finish'...")
-                win32gui.PostMessage(buttons["Finish"], win32con.BM_CLICK, 0, 0)
+                _click_button(s_hwnd, target_btn)
                 finish_clicked = True
-                time.sleep(1.0)
+                time.sleep(1.5)
                 print("[install.py] Installation completed successfully!")
                 return True
 
@@ -177,6 +278,13 @@ def automate_nsis_wizard(file_path, timeout=300):
             win32gui.PostMessage(c_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             win32gui.PostMessage(c_hwnd, win32con.WM_CHAR, 13, 0)
             win32gui.PostMessage(c_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            try:
+                ctypes.windll.user32.keybd_event(0x0D, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x0D, 0, 2, 0)
+                ctypes.windll.user32.keybd_event(0x20, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x20, 0, 2, 0)
+            except Exception:
+                pass
             driver_cleared = True
             time.sleep(1.0)
 
@@ -222,8 +330,14 @@ def install_file(file_path, silent=False):
                 print(f"[install.py] Installer exited with code {res.returncode}.")
                 return True
             elif ext == ".exe":
-                # Automate the NSIS wizard (Next > -> I Agree -> Driver Console -> Finish)
-                return automate_nsis_wizard(file_path)
+                if silent:
+                    print(f"[install.py] Running NSIS installer in silent mode: {file_path} /S")
+                    res = subprocess.run([os.path.abspath(file_path), "/S"], check=True)
+                    print(f"[install.py] Installer exited with code {res.returncode}.")
+                    return True
+                else:
+                    ensure_admin()
+                    return automate_nsis_wizard(file_path)
             else:
                 print(f"[install.py] Opening file with default shell handler...")
                 os.startfile(file_path)
