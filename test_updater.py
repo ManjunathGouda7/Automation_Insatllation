@@ -10,6 +10,7 @@ from down import (
 )
 from install import extract_zip
 from mail import (
+    check_local_inbox,
     extract_links_from_content,
     extract_version,
     extract_version_and_download_link,
@@ -147,6 +148,37 @@ class TestUpdater(unittest.TestCase):
         direct_link = _extract_download_link_from_preview_html(html_preview, "https://grlps.sharepoint.com/sites/releases")
         self.assertEqual(direct_link, "https://grlps.sharepoint.com/_layouts/15/download.aspx?UniqueId=abc-123-xyz")
 
+    def test_check_local_inbox_txt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_txt = os.path.join(temp_dir, "email.txt")
+            with open(sample_txt, "w", encoding="utf-8") as f:
+                f.write("Please find the download link for V-DPWR-EPR software (version v1.1.1.3): https://files.grl.com/releases/V-DPWR-EPR_v1.1.1.3.exe")
+
+            res = check_local_inbox(inbox_dir=temp_dir, target_software="V-DPWR-EPR")
+            self.assertIsNotNone(res)
+            self.assertEqual(res["version"], "1.1.1.3")
+            self.assertEqual(res["url"], "https://files.grl.com/releases/V-DPWR-EPR_v1.1.1.3.exe")
+
+    def test_check_local_inbox_eml(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_eml = os.path.join(temp_dir, "notification.eml")
+            eml_content = (
+                "From: release@grlps.com\r\n"
+                "To: user@grlps.com\r\n"
+                "Subject: New Release: V-DPWR-EPR v1.1.1.4\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "\r\n"
+                "<p>Please find the download link for V-DPWR-EPR software (version <a href=\"https://sharepoint.com/v1.1.1.4.zip\">v1.1.1.4</a>).</p>"
+            )
+            with open(sample_eml, "wb") as f:
+                f.write(eml_content.encode("utf-8"))
+
+            res = check_local_inbox(inbox_dir=temp_dir, target_software="V-DPWR-EPR")
+            self.assertIsNotNone(res)
+            self.assertEqual(res["version"], "1.1.1.4")
+            self.assertEqual(res["url"], "https://sharepoint.com/v1.1.1.4.zip")
+
 
 if __name__ == "__main__":
     unittest.main()
+

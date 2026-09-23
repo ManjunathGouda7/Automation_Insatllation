@@ -313,6 +313,10 @@ def _get_msgraph_token(cfg):
                 json.dump(res_data, f)
             print("[mail.py] Authentication approved! Token saved to cache.")
             return res_data["access_token"]
+        elif res_data.get("error") == "access_denied" or "53003" in str(res_data) or "conditional access" in str(res_data).lower():
+            print("\n[mail.py] [NOTICE] Microsoft Entra ID Conditional Access Policy blocked the sign-in.")
+            print("[mail.py] Corporate IT policy restricts public client Device Code access to your mailbox.")
+            return None
         elif res_data.get("error") == "authorization_pending":
             continue
         elif res_data.get("error") == "slow_down":
@@ -369,6 +373,96 @@ def fetch_update_via_msgraph(cfg):
     return None
 
 
+def check_local_inbox(inbox_dir="inbox", target_software="V-DPWR-EPR"):
+    """Checks the local inbox directory for saved emails or text files (.eml, .msg, .txt, .html).
+
+    Returns an info dict {'url': ..., 'version': ..., 'subject': ...} or None.
+    """
+    if not os.path.exists(inbox_dir):
+        return None
+
+    files = [
+        os.path.join(inbox_dir, f)
+        for f in os.listdir(inbox_dir)
+        if os.path.isfile(os.path.join(inbox_dir, f)) and not f.startswith(".")
+    ]
+    if not files:
+        return None
+
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+    for fpath in files:
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in [".eml", ".msg"]:
+            try:
+                with open(fpath, "rb") as f:
+                    msg = email.message_from_binary_file(f)
+                subject = _decode_mime_header(msg.get("Subject", ""))
+                plain, html = _extract_email_contents(msg)
+                url, ver = extract_version_and_download_link(plain, html, target_software)
+                if url:
+                    print(f"[mail.py] Found match in local email file: {os.path.basename(fpath)}")
+                    if ver:
+                        print(f"[mail.py] Detected software version: {ver}")
+                    print(f"[mail.py] Extracted URL: {url}")
+                    return {"url": url, "version": ver, "subject": subject or os.path.basename(fpath)}
+            except Exception as e:
+                print(f"[mail.py] Notice: Could not parse email file {fpath}: {e}")
+        elif ext in [".txt", ".html", ".htm"]:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                plain = content if ext == ".txt" else ""
+                html = content if ext in [".html", ".htm"] else ""
+                url, ver = extract_version_and_download_link(plain, html, target_software)
+                if url:
+                    print(f"[mail.py] Found match in local file: {os.path.basename(fpath)}")
+                    if ver:
+                        print(f"[mail.py] Detected software version: {ver}")
+                    print(f"[mail.py] Extracted URL: {url}")
+                    return {"url": url, "version": ver, "subject": os.path.basename(fpath)}
+            except Exception as e:
+                print(f"[mail.py] Notice: Could not read file {fpath}: {e}")
+
+    return None
+
+
+def _prompt_for_manual_link(target_software="V-DPWR-EPR"):
+    """Interactively prompts user for download link or email text if automated access is blocked."""
+    import sys
+
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+
+    print("\n" + "=" * 65)
+    print("      ALTERNATIVE: PROVIDE DOWNLOAD LINK OR EMAIL TEXT")
+    print("=" * 65)
+    print("Due to corporate IT Conditional Access restrictions on email login,")
+    print("you can provide the link in any of the following convenient ways:")
+    print("  1. Paste the SharePoint / OneDrive link directly below")
+    print("  2. Paste the text from the email notification")
+    print("  3. Or run: python main.py --url \"<YOUR_LINK>\"")
+    print("  4. Or save the email (.eml / .txt) into the 'inbox/' folder")
+    print("=" * 65)
+    try:
+        user_input = input("\nEnter download link or email text (or press Enter to exit): ").strip()
+        user_input = user_input.strip("\"' ")
+        if user_input:
+            url, ver = extract_version_and_download_link(user_input, user_input, target_software)
+            found_url = url or (user_input if user_input.startswith("http") else None)
+            if found_url:
+                print(f"[mail.py] Link accepted: {found_url}")
+                if ver:
+                    print(f"[mail.py] Detected software version: {ver}")
+                return {"url": found_url, "version": ver, "subject": "Interactive Input"}
+            else:
+                print("[mail.py] [WARNING] Could not find a valid HTTP/HTTPS link in the entered text.")
+    except (EOFError, KeyboardInterrupt):
+        print("\n[mail.py] Prompt cancelled.")
+
+    return None
+
+
 def get_latest_update_info(config_path="config.json"):
     """Fetches the latest email matching the software criteria and returns update info dictionary."""
     cfg = load_config(config_path)
@@ -376,17 +470,26 @@ def get_latest_update_info(config_path="config.json"):
     target_software = cfg.get("target_software", "V-DPWR-EPR")
     subject_keyword = cfg.get("subject_keyword", target_software)
     days_back = int(cfg.get("days_back", 2))
-    test_download_url = cfg.get("test_download_url", "").strip()
+    test_download_url = cfg.get("test_download_url", "").strip() or cfg.get("download_url", "").strip()
+    inbox_dir = cfg.get("inbox_dir", "inbox")
 
-    # If Graph API is explicitly chosen or forced
+    # 1. Check local inbox directory
+    local_match = check_local_inbox(inbox_dir, target_software)
+    if local_match:
+        return local_match
+
+    # 2. Check if direct download URL is configured
+    if test_download_url:
+        print(f"[mail.py] Using configured download URL: {test_download_url}")
+        return {"url": test_download_url, "version": None, "subject": "Config URL"}
+
+    # 3. If Graph API is explicitly chosen or forced
     if cfg.get("use_graph") or cfg.get("auth_method") == "graph":
         print("[mail.py] Using Microsoft Graph API authentication...")
         res = fetch_update_via_msgraph(cfg)
         if res:
             return res
-        if test_download_url:
-            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
-        return None
+        return _prompt_for_manual_link(target_software)
 
     print(f"[mail.py] Target Software: {target_software}")
     print(f"[mail.py] Date filter: past {days_back} day(s)")
@@ -406,16 +509,10 @@ def get_latest_update_info(config_path="config.json"):
             graph_res = fetch_update_via_msgraph(cfg)
             if graph_res:
                 return graph_res
-        if test_download_url:
-            print(f"[mail.py] Using fallback test_download_url from config: {test_download_url}")
-            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
-        return None
+        return _prompt_for_manual_link(target_software)
     except Exception as e:
         print(f"[mail.py] [ERROR] Connection error: {e}")
-        if test_download_url:
-            print(f"[mail.py] Using fallback test_download_url from config: {test_download_url}")
-            return {"url": test_download_url, "version": None, "subject": "Test Fallback"}
-        return None
+        return _prompt_for_manual_link(target_software)
 
     try:
         mail.select("INBOX")
@@ -431,7 +528,7 @@ def get_latest_update_info(config_path="config.json"):
             status, messages = mail.search(None, "ALL")
             if status != "OK" or not messages[0]:
                 print("[mail.py] Inbox is empty.")
-                return None
+                return _prompt_for_manual_link(target_software)
 
         mail_ids = messages[0].split()
         print(f"[mail.py] Found {len(mail_ids)} candidate emails. Scanning newest first...")
@@ -472,7 +569,7 @@ def get_latest_update_info(config_path="config.json"):
                 }
 
         print(f"[mail.py] No matching emails with download links found for {target_software}.")
-        return None
+        return _prompt_for_manual_link(target_software)
 
     finally:
         try:
