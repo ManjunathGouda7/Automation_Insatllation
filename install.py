@@ -91,8 +91,13 @@ def install_file(file_path, silent=False):
                 # If silent, try common silent switch /S
                 args = [os.path.abspath(file_path), "/S"] if silent else [os.path.abspath(file_path)]
                 print(f"[install.py] Running executable: {' '.join(args)}")
-                res = subprocess.run(args, check=True)
-                print(f"[install.py] Installer exited with code {res.returncode}.")
+                try:
+                    res = subprocess.run(args, check=True)
+                    print(f"[install.py] Installer exited with code {res.returncode}.")
+                except OSError as e:
+                    # Windows Error 740: The requested operation requires elevation
+                    print(f"[install.py] Elevation required ({e}). Launching with Windows UAC prompt...")
+                    os.startfile(file_path)
             else:
                 print(f"[install.py] Opening file with default shell handler...")
                 os.startfile(file_path)

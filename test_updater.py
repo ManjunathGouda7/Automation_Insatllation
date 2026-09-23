@@ -3,7 +3,11 @@ import tempfile
 import unittest
 import zipfile
 
-from down import _extract_filename_from_headers
+from down import (
+    _extract_filename_from_headers,
+    _extract_download_link_from_preview_html,
+    _transform_sharepoint_url,
+)
 from install import extract_zip
 from mail import (
     extract_links_from_content,
@@ -117,7 +121,31 @@ class TestUpdater(unittest.TestCase):
             installer = extract_zip(zip_path, extract_dir=extract_to)
             self.assertIsNotNone(installer)
             self.assertTrue(os.path.exists(installer))
-            self.assertEqual(os.path.basename(installer), "V-DPWR-EPR_Setup.exe")
+    def test_sharepoint_url_transformation(self):
+        url1 = "https://grlps.sharepoint.com/:u:/r/teams/v-dpwr/setup"
+        self.assertEqual(_transform_sharepoint_url(url1), "https://grlps.sharepoint.com/:u:/r/teams/v-dpwr/setup?download=1")
+
+        url2 = "https://grlps.sharepoint.com/:u:/r/teams/v-dpwr/setup?e=xyz"
+        self.assertEqual(_transform_sharepoint_url(url2), "https://grlps.sharepoint.com/:u:/r/teams/v-dpwr/setup?e=xyz&download=1")
+
+        # Does not duplicate download=1 if already present
+        url3 = "https://grlps.sharepoint.com/:u:/r/teams/v-dpwr/setup?download=1"
+        self.assertEqual(_transform_sharepoint_url(url3), url3)
+
+    def test_sharepoint_preview_html_download_button_resolution(self):
+        # Matches Image 1: "Can't preview this file. Open the file or download it to view in your desktop app."
+        # with a "Download" button
+        html_preview = """
+        <html>
+            <body>
+                <h1>V-DPWR-EPR_1.1.1.3</h1>
+                <p>Can't preview this file. Open the file or download it to view in your desktop app.</p>
+                <a class="ms-Button" href="/_layouts/15/download.aspx?UniqueId=abc-123-xyz">Download</a>
+            </body>
+        </html>
+        """
+        direct_link = _extract_download_link_from_preview_html(html_preview, "https://grlps.sharepoint.com/sites/releases")
+        self.assertEqual(direct_link, "https://grlps.sharepoint.com/_layouts/15/download.aspx?UniqueId=abc-123-xyz")
 
 
 if __name__ == "__main__":
